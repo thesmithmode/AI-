@@ -27,6 +27,9 @@ export const useLiveAPI = ({ onTranscriptionUpdate }: UseLiveAPIProps) => {
   const activeSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const processingModelTurnRef = useRef<boolean>(false);
   
+  // Control Logic State
+  const ignoringNextTurnRef = useRef<boolean>(false);
+  
   // API Session
   const sessionPromiseRef = useRef<Promise<any> | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -64,6 +67,7 @@ export const useLiveAPI = ({ onTranscriptionUpdate }: UseLiveAPIProps) => {
     setIsMuted(false);
     nextStartTimeRef.current = 0;
     processingModelTurnRef.current = false;
+    ignoringNextTurnRef.current = false;
   }, []);
 
   // Helper: Mute/Unmute Logic
@@ -77,15 +81,20 @@ export const useLiveAPI = ({ onTranscriptionUpdate }: UseLiveAPIProps) => {
   }, []);
 
   const stopAudioPlayback = useCallback(() => {
+    // 1. Synchronously stop all sources
+    activeSourcesRef.current.forEach(source => {
+        try { source.stop(); } catch (e) { /* ignore */ }
+    });
+    activeSourcesRef.current.clear();
+    
+    // 2. Reset time cursor
     if (outputAudioContextRef.current) {
-        activeSourcesRef.current.forEach(source => {
-            try { source.stop(); } catch (e) { /* ignore */ }
-        });
-        activeSourcesRef.current.clear();
         nextStartTimeRef.current = outputAudioContextRef.current.currentTime;
-        processingModelTurnRef.current = false;
-        setIsPlaying(false);
     }
+
+    // 3. Reset logic flags
+    processingModelTurnRef.current = false;
+    setIsPlaying(false); // Trigger React update last
   }, []);
 
   const sendTextMessage = useCallback((text: string) => {
@@ -94,6 +103,17 @@ export const useLiveAPI = ({ onTranscriptionUpdate }: UseLiveAPIProps) => {
               session.sendRealtimeInput({ text });
           });
       }
+  }, []);
+
+  // Sends a hidden system command.
+  // We set ignoringNextTurnRef = true so the model's verbal "Okay" response is discarded.
+  const sendControlMessage = useCallback((text: string) => {
+    if (sessionPromiseRef.current) {
+        ignoringNextTurnRef.current = true; // Flag to ignore the audio response
+        sessionPromiseRef.current.then(session => {
+            session.sendRealtimeInput({ text });
+        });
+    }
   }, []);
 
   const connect = useCallback(async () => {
@@ -140,7 +160,7 @@ export const useLiveAPI = ({ onTranscriptionUpdate }: UseLiveAPIProps) => {
             4. Keep responses concise and natural.
             5. NEVER pretend to be a monolingual English speaker.
             
-            IMPORTANT: If the user asks you to speak faster or slower, ADJUST your speaking rate immediately for all future responses.
+            IMPORTANT: If you receive a system instruction about speed (e.g., "[SYSTEM: ...]), ADAPT IMMEDIATELY for the next sentence. Do not discuss the speed setting.
 
             Example:
             User (RU): Как будет "собака"?
@@ -185,65 +205,110 @@ export const useLiveAPI = ({ onTranscriptionUpdate }: UseLiveAPIProps) => {
             processor.connect(inputAudioContextRef.current.destination);
           },
           onmessage: async (message: LiveServerMessage) => {
-            if (onTranscriptionUpdate) {
-                if (message.serverContent?.outputTranscription?.text) {
-                    onTranscriptionUpdate('', message.serverContent.outputTranscription.text);
-                } else if (message.serverContent?.inputTranscription?.text) {
-                    onTranscriptionUpdate(message.serverContent.inputTranscription.text, '');
+            // Check turn completion
+            if (message.serverContent?.turnComplete) {
+                 processingModelTurnRef.current = false;
+                 
+                 // If we were ignoring this turn (control message), reset the flag
+                 if (ignoringNextTurnRef.current) {
+                     ignoringNextTurnRef.current = false;
+                 }
+
+                 // Standard logic: If no active audio is playing, unmute immediately
+                 // (Though typically turnComplete happens after the USER speaks, so we MUTE)
+                 // WAIT: turnComplete is sent by server when SERVER is done? No.
+                 // In Gemini Live API, turnComplete usually signals the end of the USER's turn being processed?
+                 // Actually, for Live API, turnComplete often means the model has finished its response generation.
+                 
+                 // However, for the "Walkie-Talkie" logic requested:
+                 // "Automatically apply mute to my mic if I finished speaking."
+                 // The Model detects the end of user speech (VAD).
+                 
+                 // If the message contains `interrupted`, it means the user spoke.
+            }
+            
+            // Handle Transcription (filtering out control messages)
+            if (!ignoringNextTurnRef.current) {
+                if (onTranscriptionUpdate) {
+                    if (message.serverContent?.outputTranscription?.text) {
+                        onTranscriptionUpdate('', message.serverContent.outputTranscription.text);
+                    } else if (message.serverContent?.inputTranscription?.text) {
+                        onTranscriptionUpdate(message.serverContent.inputTranscription.text, '');
+                    }
                 }
             }
 
-            if (message.serverContent?.turnComplete) {
-                 processingModelTurnRef.current = false;
-                 // If no active audio is playing, unmute immediately
-                 if (activeSourcesRef.current.size === 0) {
-                     setMediaMute(false);
-                 }
-            }
-
+            // Handle Audio
             const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
-            if (base64Audio && outputAudioContextRef.current && outputNodeRef.current) {
-                // Audio incoming -> Mute mic to prevent echo/feedback during playback
-                // and to follow "Mic starts listening AFTER answer" rule
-                setMediaMute(true);
-                processingModelTurnRef.current = true;
-                setIsPlaying(true);
+            if (base64Audio) {
+                if (ignoringNextTurnRef.current) {
+                    // Silently discard this audio chunk (it's likely "Okay" or "Understood")
+                    return;
+                }
 
-                const ctx = outputAudioContextRef.current;
-                nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
-                
-                const audioBuffer = await decodeAudioData(
-                    decode(base64Audio),
-                    ctx,
-                    24000,
-                    1
-                );
-
-                const source = ctx.createBufferSource();
-                source.buffer = audioBuffer;
-                source.connect(outputNodeRef.current);
-                
-                source.addEventListener('ended', () => {
-                    activeSourcesRef.current.delete(source);
-                    // Check if queue is empty
-                    if (activeSourcesRef.current.size === 0) {
-                        setIsPlaying(false);
-                        // If this was the last source AND the model is done generating, unmute
-                        if (!processingModelTurnRef.current) {
-                            setMediaMute(false);
-                        }
+                if (outputAudioContextRef.current && outputNodeRef.current) {
+                    // 1. Audio incoming -> Mute mic to prevent echo/feedback
+                    // The model is starting to speak (or streaming chunks).
+                    if (!isMuted) {
+                        setMediaMute(true); 
                     }
-                });
+                    
+                    processingModelTurnRef.current = true;
+                    setIsPlaying(true);
 
-                source.start(nextStartTimeRef.current);
-                activeSourcesRef.current.add(source);
-                nextStartTimeRef.current += audioBuffer.duration;
+                    const ctx = outputAudioContextRef.current;
+                    nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
+                    
+                    const audioBuffer = await decodeAudioData(
+                        decode(base64Audio),
+                        ctx,
+                        24000,
+                        1
+                    );
+
+                    const source = ctx.createBufferSource();
+                    source.buffer = audioBuffer;
+                    source.connect(outputNodeRef.current);
+                    
+                    source.addEventListener('ended', () => {
+                        activeSourcesRef.current.delete(source);
+                        // Check if queue is empty
+                        if (activeSourcesRef.current.size === 0) {
+                            setIsPlaying(false);
+                            // Do NOT automatically unmute here. 
+                            // The user requested: "Mic icon shows muted. I click it to speak."
+                            // But also: "Automatically mute if I finished speaking."
+                            // Logic:
+                            // 1. User speaks -> Silence -> Model speaks (Mic Muted)
+                            // 2. Model finishes -> Mic stays Muted? Or Mic opens?
+                            // User said: "Микрофон должен начинать меня слушать сразу после окончания ответа нейросети"
+                            // (Mic should start listening immediately after AI finishes answer)
+                            
+                            // So:
+                            if (!processingModelTurnRef.current) {
+                                setMediaMute(false); // Open mic automatically when AI finishes
+                            }
+                        }
+                    });
+
+                    source.start(nextStartTimeRef.current);
+                    activeSourcesRef.current.add(source);
+                    nextStartTimeRef.current += audioBuffer.duration;
+                }
             }
 
+            // Server-side turn completion or interruption
             if (message.serverContent?.interrupted) {
                 stopAudioPlayback();
-                // If interrupted, we assume user wants to speak, so ensure unmute
-                setMediaMute(false);
+                setMediaMute(false); // User interrupted, so ensure mic is open
+            }
+            
+            // Explicit turnComplete usually comes at end of generation
+            if (message.serverContent?.turnComplete) {
+                // If queue is empty, we can unmute
+                if (activeSourcesRef.current.size === 0) {
+                     setMediaMute(false);
+                }
             }
           },
           onclose: () => {
@@ -272,42 +337,26 @@ export const useLiveAPI = ({ onTranscriptionUpdate }: UseLiveAPIProps) => {
     cleanup();
   }, [cleanup]);
 
+  // The Big Button Logic
   const toggleMute = useCallback(() => {
-    // INTERRUPT LOGIC:
-    // If audio is playing (queue not empty), we stop it and UNMUTE.
-    if (activeSourcesRef.current.size > 0) {
-        stopAudioPlayback();
-        setMediaMute(false); // Enable mic to talk
+    // 1. If AI is speaking (Playing), this is an INTERRUPT.
+    if (activeSourcesRef.current.size > 0 || isPlaying) {
+        stopAudioPlayback(); // Immediate silence
+        setMediaMute(false); // Immediate mic open
         return;
     }
 
-    // MANUAL MUTE LOGIC:
-    // If no audio is playing, allow user to toggle mute manually.
+    // 2. If AI is silent, this is a standard Mic Toggle.
     if (streamRef.current) {
       const audioTracks = streamRef.current.getAudioTracks();
       if (audioTracks.length > 0) {
         const isCurrentlyEnabled = audioTracks[0].enabled;
-        setMediaMute(isCurrentlyEnabled); // If enabled (true), mute it (false).
+        // If enabled (true), we want to MUTE (false).
+        // If disabled (false/muted), we want to UNMUTE (true).
+        setMediaMute(isCurrentlyEnabled); 
       }
     }
-  }, [stopAudioPlayback, setMediaMute]);
-
-  useEffect(() => {
-    let animationFrameId: number;
-    const updateVisualizer = () => {
-      if (analyserRef.current && connectionState === ConnectionState.CONNECTED) {
-        const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount);
-        analyserRef.current.getByteFrequencyData(dataArray);
-        let sum = 0;
-        for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
-        const avg = sum / dataArray.length;
-        if (avg > 10) setVolume(Math.min(avg / 128, 1));
-      }
-      animationFrameId = requestAnimationFrame(updateVisualizer);
-    };
-    updateVisualizer();
-    return () => cancelAnimationFrame(animationFrameId);
-  }, [connectionState]);
+  }, [stopAudioPlayback, setMediaMute, isPlaying]);
 
   return {
     connect,
@@ -318,6 +367,7 @@ export const useLiveAPI = ({ onTranscriptionUpdate }: UseLiveAPIProps) => {
     errorMessage,
     volume,
     sendTextMessage,
-    isPlaying // Now a reactive state
+    sendControlMessage,
+    isPlaying
   };
 };

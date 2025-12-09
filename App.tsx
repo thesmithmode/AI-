@@ -61,7 +61,7 @@ const App: React.FC = () => {
     });
   }, []);
 
-  const { connect, disconnect, toggleMute, isMuted, isPlaying, connectionState, errorMessage, volume, sendTextMessage } = useLiveAPI({
+  const { connect, disconnect, toggleMute, isMuted, isPlaying, connectionState, errorMessage, volume, sendControlMessage } = useLiveAPI({
     onTranscriptionUpdate: handleTranscriptionUpdate
   });
 
@@ -71,21 +71,21 @@ const App: React.FC = () => {
 
   const handleSpeedCommit = () => {
       let prompt = "";
-      // Stronger prompts for speed control
-      if (speedLevel <= 20) {
-          prompt = "INSTRUCTION: Speak EXTREMELY SLOWLY and articulate every syllable clearly.";
-      } else if (speedLevel <= 40) {
-          prompt = "INSTRUCTION: Speak slowly and clearly.";
+      // Strong, distinct prompts for each level
+      if (speedLevel <= 10) {
+          prompt = "[SYSTEM: SPEAK_EXTREMELY_SLOWLY]. Enunciate every syllable like teaching a beginner.";
+      } else if (speedLevel <= 30) {
+          prompt = "[SYSTEM: SPEAK_SLOWLY]. Speak clearly and slowly.";
       } else if (speedLevel <= 60) {
-          prompt = "INSTRUCTION: Speak at a normal, natural conversational pace.";
-      } else if (speedLevel <= 80) {
-          prompt = "INSTRUCTION: Speak quickly.";
+          prompt = "[SYSTEM: SPEAK_NORMALLY]. Use a natural conversational pace.";
+      } else if (speedLevel <= 85) {
+          prompt = "[SYSTEM: SPEAK_FAST]. Speak quickly, like a fluent native speaker.";
       } else {
-          prompt = "INSTRUCTION: Speak very fast, like a native speaker in a rush.";
+          prompt = "[SYSTEM: SPEAK_EXTREMELY_FAST]. Speak very fast, rapid-fire English.";
       }
       
-      console.log("Sending speed instruction:", prompt);
-      sendTextMessage(prompt);
+      // Use sendControlMessage to suppress the verbal "Okay" and the transcript log
+      sendControlMessage(prompt);
   };
 
   const copyToClipboard = (text: string, type: 'user' | 'model' | 'all', index?: number) => {
@@ -159,9 +159,9 @@ const App: React.FC = () => {
         {/* Visualizer Area */}
         <div className="flex-none p-6 flex flex-col items-center justify-center bg-slate-900 min-h-[140px] relative transition-colors duration-500 border-b border-slate-800">
            <Visualizer isActive={connectionState === ConnectionState.CONNECTED && !isMuted} volume={volume} />
-           <p className="mt-4 text-slate-400 text-sm font-medium animate-fade-in">
+           <p className="mt-4 text-slate-400 text-sm font-medium animate-fade-in h-5">
              {connectionState === ConnectionState.CONNECTED 
-               ? (isPlaying ? 'AI говорит...' : (isMuted ? 'Микрофон выключен (нажмите чтобы включить)' : 'Слушаю вас...'))
+               ? (isPlaying ? 'AI говорит...' : (isMuted ? 'Микрофон выключен (нажмите чтобы говорить)' : 'Слушаю вас...'))
                : 'Начните урок'}
            </p>
         </div>
@@ -226,6 +226,7 @@ const App: React.FC = () => {
                         type="range" 
                         min="0" 
                         max="100" 
+                        step="10"
                         value={speedLevel}
                         onChange={handleSpeedChange}
                         onMouseUp={handleSpeedCommit}
@@ -280,7 +281,7 @@ const App: React.FC = () => {
             </div>
             {connectionState === ConnectionState.CONNECTED && (
                  <div className="text-center mt-3 text-xs text-slate-400">
-                     {isPlaying ? 'Нажмите, чтобы прервать AI' : (isMuted ? 'Микрофон отключен (вас не слышно)' : 'Микрофон включен (вас слышно)')}
+                     {isPlaying ? 'Нажмите, чтобы прервать AI и говорить' : (isMuted ? 'Микрофон отключен. Нажмите, чтобы говорить' : 'Микрофон включен. Говорите, AI ответит когда вы закончите')}
                  </div>
             )}
         </div>
