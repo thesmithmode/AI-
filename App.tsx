@@ -15,6 +15,20 @@ const CheckIcon = ({ className }: { className?: string }) => (
   </svg>
 );
 
+const MicIcon = ({ className }: { className?: string }) => (
+  <svg xmlns="http://www.w3.org/2000/svg" className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
+  </svg>
+);
+
+const MicOffIcon = ({ className }: { className?: string }) => (
+  <svg xmlns="http://www.w3.org/2000/svg" className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v2.828m0 4.344V19a1 1 0 01-1.707.707L5.586 15z" />
+    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2" />
+  </svg>
+);
+
+
 const App: React.FC = () => {
   const [transcript, setTranscript] = useState<{user: string, model: string}[]>([]);
   const [copiedIndex, setCopiedIndex] = useState<{type: 'user'|'model'|'all', index?: number} | null>(null);
@@ -44,7 +58,7 @@ const App: React.FC = () => {
     });
   }, []);
 
-  const { connect, disconnect, connectionState, errorMessage, volume } = useLiveAPI({
+  const { connect, disconnect, toggleMute, isMuted, connectionState, errorMessage, volume } = useLiveAPI({
     onTranscriptionUpdate: handleTranscriptionUpdate,
     audioSpeed
   });
@@ -119,11 +133,33 @@ const App: React.FC = () => {
         </div>
 
         {/* Visualizer Area */}
-        <div className="flex-none p-8 flex flex-col items-center justify-center bg-slate-900 min-h-[160px]">
-           <Visualizer isActive={connectionState === ConnectionState.CONNECTED} volume={volume} />
+        <div className="flex-none p-8 flex flex-col items-center justify-center bg-slate-900 min-h-[160px] relative">
+           <Visualizer isActive={connectionState === ConnectionState.CONNECTED && !isMuted} volume={volume} />
            <p className="mt-4 text-slate-400 text-sm font-medium">
-             {connectionState === ConnectionState.CONNECTED ? 'Слушаю... (говорите по-русски или по-английски)' : 'Нажмите кнопку, чтобы начать урок'}
+             {connectionState === ConnectionState.CONNECTED 
+               ? (isMuted ? 'Микрофон выключен' : 'Слушаю... (говорите по-русски или по-английски)')
+               : 'Нажмите кнопку, чтобы начать урок'}
            </p>
+           
+           {/* Mute Button Overlay */}
+           {connectionState === ConnectionState.CONNECTED && (
+             <button
+               onClick={toggleMute}
+               className={`absolute top-4 right-4 p-2 rounded-full transition-colors ${
+                 isMuted ? 'bg-red-500 hover:bg-red-600 text-white' : 'bg-slate-700 hover:bg-slate-600 text-slate-300'
+               }`}
+               title={isMuted ? "Включить микрофон" : "Выключить микрофон"}
+             >
+               {isMuted ? (
+                 <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
+                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 3l18 18" />
+                 </svg>
+               ) : (
+                  <MicIcon className="h-5 w-5" />
+               )}
+             </button>
+           )}
         </div>
 
         {/* Transcript Area */}
@@ -140,7 +176,7 @@ const App: React.FC = () => {
                         <div className="flex justify-end items-end group gap-2">
                             <button 
                                 onClick={() => copyToClipboard(turn.user, 'user', idx)}
-                                className="opacity-0 group-hover:opacity-100 transition-opacity text-slate-400 hover:text-indigo-600 p-1"
+                                className="text-slate-300 hover:text-indigo-600 p-1 transition-colors"
                                 title="Копировать"
                             >
                                 {copiedIndex?.type === 'user' && copiedIndex?.index === idx ? <CheckIcon className="h-4 w-4" /> : <CopyIcon className="h-4 w-4" />}
@@ -157,7 +193,7 @@ const App: React.FC = () => {
                             </div>
                             <button 
                                 onClick={() => copyToClipboard(turn.model, 'model', idx)}
-                                className="opacity-0 group-hover:opacity-100 transition-opacity text-slate-400 hover:text-indigo-600 p-1"
+                                className="text-slate-300 hover:text-indigo-600 p-1 transition-colors"
                                 title="Копировать"
                             >
                                 {copiedIndex?.type === 'model' && copiedIndex?.index === idx ? <CheckIcon className="h-4 w-4" /> : <CopyIcon className="h-4 w-4" />}
@@ -194,20 +230,22 @@ const App: React.FC = () => {
                 />
             </div>
 
-            <button
-                onClick={handleToggleConnection}
-                disabled={connectionState === ConnectionState.CONNECTING}
-                className={`
-                    w-full py-3 px-6 rounded-xl font-bold text-white shadow-lg transition-all transform hover:scale-[1.02] active:scale-[0.98]
-                    ${connectionState === ConnectionState.CONNECTED 
-                        ? 'bg-red-500 hover:bg-red-600 shadow-red-500/30' 
-                        : 'bg-indigo-600 hover:bg-indigo-700 shadow-indigo-600/30'}
-                    disabled:opacity-70 disabled:cursor-not-allowed
-                `}
-            >
-                {connectionState === ConnectionState.CONNECTED ? 'Закончить урок' : 
-                 connectionState === ConnectionState.CONNECTING ? 'Подключение...' : 'Начать урок'}
-            </button>
+            <div className="flex w-full gap-2">
+                <button
+                    onClick={handleToggleConnection}
+                    disabled={connectionState === ConnectionState.CONNECTING}
+                    className={`
+                        flex-1 py-3 px-6 rounded-xl font-bold text-white shadow-lg transition-all transform hover:scale-[1.02] active:scale-[0.98]
+                        ${connectionState === ConnectionState.CONNECTED 
+                            ? 'bg-red-500 hover:bg-red-600 shadow-red-500/30' 
+                            : 'bg-indigo-600 hover:bg-indigo-700 shadow-indigo-600/30'}
+                        disabled:opacity-70 disabled:cursor-not-allowed
+                    `}
+                >
+                    {connectionState === ConnectionState.CONNECTED ? 'Закончить урок' : 
+                     connectionState === ConnectionState.CONNECTING ? 'Подключение...' : 'Начать урок'}
+                </button>
+            </div>
             
             <p className="text-xs text-slate-400 mt-1">
                 Для лучшего опыта используйте наушники.

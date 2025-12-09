@@ -12,6 +12,7 @@ export const useLiveAPI = ({ onTranscriptionUpdate, audioSpeed }: UseLiveAPIProp
   const [connectionState, setConnectionState] = useState<ConnectionState>(ConnectionState.DISCONNECTED);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [volume, setVolume] = useState<number>(0); // 0 to 1 normalized volume for visualizer
+  const [isMuted, setIsMuted] = useState<boolean>(false);
 
   // Audio Contexts and Nodes
   const inputAudioContextRef = useRef<AudioContext | null>(null);
@@ -69,6 +70,7 @@ export const useLiveAPI = ({ onTranscriptionUpdate, audioSpeed }: UseLiveAPIProp
 
     setConnectionState(ConnectionState.DISCONNECTED);
     setVolume(0);
+    setIsMuted(false);
     nextStartTimeRef.current = 0;
   }, []);
 
@@ -76,6 +78,7 @@ export const useLiveAPI = ({ onTranscriptionUpdate, audioSpeed }: UseLiveAPIProp
     try {
       setConnectionState(ConnectionState.CONNECTING);
       setErrorMessage(null);
+      setIsMuted(false);
 
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
@@ -158,7 +161,11 @@ export const useLiveAPI = ({ onTranscriptionUpdate, audioSpeed }: UseLiveAPIProp
               let sum = 0;
               for(let i=0; i<inputData.length; i++) sum += inputData[i] * inputData[i];
               const rms = Math.sqrt(sum / inputData.length);
-              setVolume(Math.min(rms * 5, 1)); // Amplify for visualizer
+              
+              // Only update volume from mic if not muted (though hardware mute handles silence, this is safer)
+              if (streamRef.current?.getAudioTracks()[0]?.enabled) {
+                   setVolume(Math.min(rms * 5, 1)); 
+              }
 
               sessionPromise.then((session) => {
                 session.sendRealtimeInput({ media: pcmBlob });
@@ -247,6 +254,15 @@ export const useLiveAPI = ({ onTranscriptionUpdate, audioSpeed }: UseLiveAPIProp
     cleanup();
   }, [cleanup]);
 
+  const toggleMute = useCallback(() => {
+    if (streamRef.current) {
+      streamRef.current.getAudioTracks().forEach(track => {
+        track.enabled = !track.enabled;
+      });
+      setIsMuted(prev => !prev);
+    }
+  }, []);
+
   // Animation frame loop for output volume visualizer
   useEffect(() => {
     let animationFrameId: number;
@@ -262,8 +278,8 @@ export const useLiveAPI = ({ onTranscriptionUpdate, audioSpeed }: UseLiveAPIProp
             sum += dataArray[i];
         }
         const avg = sum / dataArray.length;
-        // If output is silent, volume might still be driven by input in onaudioprocess
-        // Only override if output is loud enough to matter
+        // If output is loud enough, override mic volume visualization
+        // (This is a simple way to share one visualizer for both RX and TX)
         if (avg > 10) { 
              setVolume(Math.min(avg / 128, 1));
         }
@@ -278,6 +294,8 @@ export const useLiveAPI = ({ onTranscriptionUpdate, audioSpeed }: UseLiveAPIProp
   return {
     connect,
     disconnect,
+    toggleMute,
+    isMuted,
     connectionState,
     errorMessage,
     volume
