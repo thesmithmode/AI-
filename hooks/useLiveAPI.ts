@@ -5,13 +5,12 @@ import { decode, decodeAudioData, createBlob } from '../utils/audio-utils';
 
 interface UseLiveAPIProps {
   onTranscriptionUpdate?: (user: string, model: string) => void;
-  audioSpeed: number;
 }
 
-export const useLiveAPI = ({ onTranscriptionUpdate, audioSpeed }: UseLiveAPIProps) => {
+export const useLiveAPI = ({ onTranscriptionUpdate }: UseLiveAPIProps) => {
   const [connectionState, setConnectionState] = useState<ConnectionState>(ConnectionState.DISCONNECTED);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [volume, setVolume] = useState<number>(0); // 0 to 1 normalized volume for visualizer
+  const [volume, setVolume] = useState<number>(0);
   const [isMuted, setIsMuted] = useState<boolean>(false);
 
   // Audio Contexts and Nodes
@@ -22,29 +21,21 @@ export const useLiveAPI = ({ onTranscriptionUpdate, audioSpeed }: UseLiveAPIProp
   const outputNodeRef = useRef<GainNode | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
 
-  // Playback Queue Management
+  // Playback State
   const nextStartTimeRef = useRef<number>(0);
   const activeSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
-
+  const processingModelTurnRef = useRef<boolean>(false);
+  
   // API Session
   const sessionPromiseRef = useRef<Promise<any> | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   
-  // Speed control ref
-  const audioSpeedRef = useRef(audioSpeed);
-
-  useEffect(() => {
-    audioSpeedRef.current = audioSpeed;
-  }, [audioSpeed]);
-
   const cleanup = useCallback(() => {
-    // Stop all active sources
     activeSourcesRef.current.forEach(source => {
       try { source.stop(); } catch (e) { /* ignore */ }
     });
     activeSourcesRef.current.clear();
 
-    // Close Audio Contexts
     if (inputAudioContextRef.current) {
       inputAudioContextRef.current.close();
       inputAudioContextRef.current = null;
@@ -54,13 +45,11 @@ export const useLiveAPI = ({ onTranscriptionUpdate, audioSpeed }: UseLiveAPIProp
       outputAudioContextRef.current = null;
     }
 
-    // Stop Microphone Stream
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(track => track.stop());
       streamRef.current = null;
     }
 
-    // Close Session (if possible, though logic relies on connection drop mostly)
     if (sessionPromiseRef.current) {
         sessionPromiseRef.current.then(session => {
             if(session.close) session.close();
@@ -72,37 +61,65 @@ export const useLiveAPI = ({ onTranscriptionUpdate, audioSpeed }: UseLiveAPIProp
     setVolume(0);
     setIsMuted(false);
     nextStartTimeRef.current = 0;
+    processingModelTurnRef.current = false;
+  }, []);
+
+  // Helper: Mute/Unmute Logic
+  const setMediaMute = useCallback((shouldMute: boolean) => {
+      if (streamRef.current) {
+          streamRef.current.getAudioTracks().forEach(track => {
+              track.enabled = !shouldMute;
+          });
+          setIsMuted(shouldMute);
+      }
+  }, []);
+
+  const stopAudioPlayback = useCallback(() => {
+    if (outputAudioContextRef.current) {
+        activeSourcesRef.current.forEach(source => {
+            try { source.stop(); } catch (e) { /* ignore */ }
+        });
+        activeSourcesRef.current.clear();
+        nextStartTimeRef.current = outputAudioContextRef.current.currentTime;
+        processingModelTurnRef.current = false;
+    }
+  }, []);
+
+  const sendTextMessage = useCallback((text: string) => {
+      if (sessionPromiseRef.current) {
+          sessionPromiseRef.current.then(session => {
+              session.sendRealtimeInput({ text });
+          });
+      }
   }, []);
 
   const connect = useCallback(async () => {
     try {
       setConnectionState(ConnectionState.CONNECTING);
       setErrorMessage(null);
-      setIsMuted(false);
-
+      
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
-      // Initialize Audio Contexts
       const inputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
       const outputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
       
       inputAudioContextRef.current = inputCtx;
       outputAudioContextRef.current = outputCtx;
 
-      // Setup Output Node
       const outputNode = outputCtx.createGain();
       outputNode.connect(outputCtx.destination);
       outputNodeRef.current = outputNode;
 
-      // Setup Visualizer Analyser
       const analyser = outputCtx.createAnalyser();
       analyser.fftSize = 256;
-      outputNode.connect(analyser); // Connect output to analyser for visualizer
+      outputNode.connect(analyser);
       analyserRef.current = analyser;
 
-      // Microphone Stream
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
+      
+      // Initialize unmuted
+      setMediaMute(false);
 
       const config = {
         model: 'gemini-2.5-flash-native-audio-preview-09-2025',
@@ -111,27 +128,18 @@ export const useLiveAPI = ({ onTranscriptionUpdate, audioSpeed }: UseLiveAPIProp
             speechConfig: {
                 voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } },
             },
-            // System instruction updated for strict bilingual support
             systemInstruction: `You are a professional bilingual language tutor. You are a native Russian speaker who is an expert in teaching English.
 
             CORE BEHAVIOR:
-            1. LISTEN CAREFULLY to the language the user is speaking.
+            1. LISTEN CAREFULLY.
             2. IF USER SPEAKS RUSSIAN: You MUST respond in RUSSIAN. Explain concepts, translate, or answer questions in clear Russian. Then, prompt them to say the English equivalent.
             3. IF USER SPEAKS ENGLISH: Respond in English to maintain the flow of practice. Correct mistakes gently.
-            4. IF USER ASKS "WHY ENGLISH?" OR IS CONFUSED: Explain in RUSSIAN that you are here to help them practice, but you understand Russian perfectly.
-            5. NEVER pretend to be a monolingual English speaker. You are a teacher helping a Russian student.
+            4. Keep responses concise and natural.
+            5. NEVER pretend to be a monolingual English speaker.
 
-            Example Interaction 1:
+            Example:
             User (RU): Как будет "собака"?
-            Model (RU): "Собака" по-английски будет "Dog". Попробуйте сказать: "I have a dog".
-
-            Example Interaction 2:
-            User (RU): Почему ты отвечаешь на английском?
-            Model (RU): Извините! Я думал, мы практикуемся. Я прекрасно говорю по-русски. Что бы вы хотели обсудить или перевести?
-
-            Example Interaction 3:
-            User (EN): Hello, how are you?
-            Model (EN): I'm doing well, thank you! How are you today?`,
+            Model (RU): "Собака" по-английски будет "Dog". Попробуйте сказать: "I have a dog".`,
             inputAudioTranscription: {},
             outputAudioTranscription: {},
         },
@@ -143,13 +151,11 @@ export const useLiveAPI = ({ onTranscriptionUpdate, audioSpeed }: UseLiveAPIProp
           onopen: () => {
             setConnectionState(ConnectionState.CONNECTED);
             
-            // Setup Input Processing Pipeline
             if (!inputAudioContextRef.current || !streamRef.current) return;
 
             const source = inputAudioContextRef.current.createMediaStreamSource(streamRef.current);
             inputSourceRef.current = source;
             
-            // Use ScriptProcessor for capturing PCM data chunks
             const processor = inputAudioContextRef.current.createScriptProcessor(4096, 1, 1);
             processorRef.current = processor;
 
@@ -157,12 +163,10 @@ export const useLiveAPI = ({ onTranscriptionUpdate, audioSpeed }: UseLiveAPIProp
               const inputData = e.inputBuffer.getChannelData(0);
               const pcmBlob = createBlob(inputData);
               
-              // Visualizer logic for input (simple volume check)
               let sum = 0;
               for(let i=0; i<inputData.length; i++) sum += inputData[i] * inputData[i];
               const rms = Math.sqrt(sum / inputData.length);
               
-              // Only update volume from mic if not muted (though hardware mute handles silence, this is safer)
               if (streamRef.current?.getAudioTracks()[0]?.enabled) {
                    setVolume(Math.min(rms * 5, 1)); 
               }
@@ -176,7 +180,6 @@ export const useLiveAPI = ({ onTranscriptionUpdate, audioSpeed }: UseLiveAPIProp
             processor.connect(inputAudioContextRef.current.destination);
           },
           onmessage: async (message: LiveServerMessage) => {
-             // Handle Transcriptions
             if (onTranscriptionUpdate) {
                 if (message.serverContent?.outputTranscription?.text) {
                     onTranscriptionUpdate('', message.serverContent.outputTranscription.text);
@@ -185,12 +188,22 @@ export const useLiveAPI = ({ onTranscriptionUpdate, audioSpeed }: UseLiveAPIProp
                 }
             }
 
-            // Handle Audio Output
+            if (message.serverContent?.turnComplete) {
+                 processingModelTurnRef.current = false;
+                 // If no active audio is playing, unmute immediately
+                 if (activeSourcesRef.current.size === 0) {
+                     setMediaMute(false);
+                 }
+            }
+
             const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
             if (base64Audio && outputAudioContextRef.current && outputNodeRef.current) {
+                // Audio incoming -> Mute mic to prevent echo/feedback during playback
+                // and to follow "Mic starts listening AFTER answer" rule
+                setMediaMute(true);
+                processingModelTurnRef.current = true;
+
                 const ctx = outputAudioContextRef.current;
-                
-                // Track start time
                 nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
                 
                 const audioBuffer = await decodeAudioData(
@@ -200,93 +213,87 @@ export const useLiveAPI = ({ onTranscriptionUpdate, audioSpeed }: UseLiveAPIProp
                     1
                 );
 
-                const currentSpeed = audioSpeedRef.current;
-
                 const source = ctx.createBufferSource();
                 source.buffer = audioBuffer;
-                source.playbackRate.value = currentSpeed;
                 source.connect(outputNodeRef.current);
                 
                 source.addEventListener('ended', () => {
                     activeSourcesRef.current.delete(source);
+                    // If this was the last source AND the model is done generating, unmute
+                    if (activeSourcesRef.current.size === 0 && !processingModelTurnRef.current) {
+                        setMediaMute(false);
+                    }
                 });
 
                 source.start(nextStartTimeRef.current);
                 activeSourcesRef.current.add(source);
-                
-                // Adjust duration based on speed
-                nextStartTimeRef.current += audioBuffer.duration / currentSpeed;
+                nextStartTimeRef.current += audioBuffer.duration;
             }
 
-            // Handle Interruptions
             if (message.serverContent?.interrupted) {
-                activeSourcesRef.current.forEach(src => {
-                    try { src.stop(); } catch(e) {}
-                });
-                activeSourcesRef.current.clear();
-                nextStartTimeRef.current = 0;
+                stopAudioPlayback();
+                // If interrupted, we assume user wants to speak, so ensure unmute
+                setMediaMute(false);
             }
           },
           onclose: () => {
             setConnectionState(ConnectionState.DISCONNECTED);
           },
           onerror: (err) => {
-            console.error("Gemini Live API Error:", err);
-            setErrorMessage("Ошибка соединения. Пожалуйста, попробуйте снова.");
+            console.error(err);
+            setErrorMessage("Ошибка соединения.");
             setConnectionState(ConnectionState.ERROR);
             cleanup();
           }
         },
-        config: config.config as any // Casting due to potential strict typing issues with specific SDK versions
+        config: config.config as any
       });
       
       sessionPromiseRef.current = sessionPromise;
 
     } catch (error: any) {
-      console.error("Connection setup failed:", error);
-      setErrorMessage(error.message || "Не удалось получить доступ к микрофону.");
+      setErrorMessage(error.message);
       setConnectionState(ConnectionState.ERROR);
       cleanup();
     }
-  }, [cleanup, onTranscriptionUpdate]);
+  }, [cleanup, onTranscriptionUpdate, stopAudioPlayback, setMediaMute]);
 
   const disconnect = useCallback(() => {
     cleanup();
   }, [cleanup]);
 
   const toggleMute = useCallback(() => {
-    if (streamRef.current) {
-      streamRef.current.getAudioTracks().forEach(track => {
-        track.enabled = !track.enabled;
-      });
-      setIsMuted(prev => !prev);
+    // If currently playing audio, this button acts as INTERRUPT
+    if (activeSourcesRef.current.size > 0) {
+        stopAudioPlayback();
+        setMediaMute(false); // Enable mic to talk
+        // Send a text signal to clear model context? Usually sending audio is enough.
+        return;
     }
-  }, []);
 
-  // Animation frame loop for output volume visualizer
+    // Normal Mute Toggle
+    if (streamRef.current) {
+      const audioTracks = streamRef.current.getAudioTracks();
+      if (audioTracks.length > 0) {
+        const isCurrentlyEnabled = audioTracks[0].enabled;
+        setMediaMute(isCurrentlyEnabled); // If enabled (true), mute it (false).
+      }
+    }
+  }, [stopAudioPlayback, setMediaMute]);
+
   useEffect(() => {
     let animationFrameId: number;
-    
     const updateVisualizer = () => {
       if (analyserRef.current && connectionState === ConnectionState.CONNECTED) {
         const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount);
         analyserRef.current.getByteFrequencyData(dataArray);
-        
-        // Calculate average volume from output
         let sum = 0;
-        for (let i = 0; i < dataArray.length; i++) {
-            sum += dataArray[i];
-        }
+        for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
         const avg = sum / dataArray.length;
-        // If output is loud enough, override mic volume visualization
-        // (This is a simple way to share one visualizer for both RX and TX)
-        if (avg > 10) { 
-             setVolume(Math.min(avg / 128, 1));
-        }
+        if (avg > 10) setVolume(Math.min(avg / 128, 1));
       }
       animationFrameId = requestAnimationFrame(updateVisualizer);
     };
-    
     updateVisualizer();
     return () => cancelAnimationFrame(animationFrameId);
   }, [connectionState]);
@@ -298,6 +305,8 @@ export const useLiveAPI = ({ onTranscriptionUpdate, audioSpeed }: UseLiveAPIProp
     isMuted,
     connectionState,
     errorMessage,
-    volume
+    volume,
+    sendTextMessage,
+    isPlaying: activeSourcesRef.current.size > 0
   };
 };
