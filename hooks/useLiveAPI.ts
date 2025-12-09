@@ -1,149 +1,195 @@
+
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
-import { ConnectionState } from '../types';
+import { ConnectionState, TurnState, SpeedMode } from '../types';
 import { decode, decodeAudioData, createBlob } from '../utils/audio-utils';
 
 interface UseLiveAPIProps {
-  onTranscriptionUpdate?: (user: string, model: string) => void;
+  onTranscriptionUpdate: (user: string, model: string) => void;
 }
 
 export const useLiveAPI = ({ onTranscriptionUpdate }: UseLiveAPIProps) => {
+  // --- State ---
   const [connectionState, setConnectionState] = useState<ConnectionState>(ConnectionState.DISCONNECTED);
+  const [turnState, setTurnState] = useState<TurnState>(TurnState.USER_SPEAKING);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [volume, setVolume] = useState<number>(0);
-  const [isMuted, setIsMuted] = useState<boolean>(false);
-  const [isPlaying, setIsPlaying] = useState<boolean>(false);
 
-  // Audio Contexts and Nodes
-  const inputAudioContextRef = useRef<AudioContext | null>(null);
-  const outputAudioContextRef = useRef<AudioContext | null>(null);
-  const inputSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
-  const processorRef = useRef<ScriptProcessorNode | null>(null);
-  const outputNodeRef = useRef<GainNode | null>(null);
-  const analyserRef = useRef<AnalyserNode | null>(null);
-
-  // Playback State
-  const nextStartTimeRef = useRef<number>(0);
-  const activeSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
-  const processingModelTurnRef = useRef<boolean>(false);
+  // --- Refs ---
+  const currentSpeedModeRef = useRef<SpeedMode>('normal');
+  const pendingSpeedUpdateRef = useRef<boolean>(false);
   
-  // Control Logic State
-  const ignoringNextTurnRef = useRef<boolean>(false);
-  
-  // API Session
-  const sessionPromiseRef = useRef<Promise<any> | null>(null);
+  // Audio Refs
+  const audioContextsRef = useRef<{ input: AudioContext; output: AudioContext } | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
   
-  const cleanup = useCallback(() => {
-    activeSourcesRef.current.forEach(source => {
-      try { source.stop(); } catch (e) { /* ignore */ }
-    });
-    activeSourcesRef.current.clear();
-    setIsPlaying(false);
+  // Queue & Playback Refs
+  const audioQueueRef = useRef<AudioBuffer[]>([]);
+  const isPlayingRef = useRef<boolean>(false);
+  const currentSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const nextStartTimeRef = useRef<number>(0);
+  const isInterruptedRef = useRef<boolean>(false);
+  
+  // API Session Ref
+  const sessionRef = useRef<any>(null);
 
-    if (inputAudioContextRef.current) {
-      inputAudioContextRef.current.close();
-      inputAudioContextRef.current = null;
+  // --- Helpers ---
+
+  const getSystemPromptForSpeed = (mode: SpeedMode): string => {
+    switch (mode) {
+      case 'v-slow': return "System: Speak extremely slowly and clearly.";
+      case 'slow': return "System: Speak slowly.";
+      case 'fast': return "System: Speak fast.";
+      case 'v-fast': return "System: Speak very fast.";
+      default: return "System: Speak at a normal conversational pace.";
     }
-    if (outputAudioContextRef.current) {
-      outputAudioContextRef.current.close();
-      outputAudioContextRef.current = null;
+  };
+
+  const playNextInQueue = useCallback(() => {
+    const ctx = audioContextsRef.current?.output;
+    if (!ctx || isInterruptedRef.current) {
+        return;
     }
 
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(track => track.stop());
-      streamRef.current = null;
+    if (audioQueueRef.current.length === 0) {
+      isPlayingRef.current = false;
+      setTurnState(TurnState.USER_SPEAKING);
+      return;
     }
 
-    if (sessionPromiseRef.current) {
-        sessionPromiseRef.current.then(session => {
-            if(session.close) session.close();
-        }).catch(() => {});
-        sessionPromiseRef.current = null;
-    }
+    isPlayingRef.current = true;
+    setTurnState(TurnState.AI_SPEAKING);
 
-    setConnectionState(ConnectionState.DISCONNECTED);
-    setVolume(0);
-    setIsMuted(false);
-    nextStartTimeRef.current = 0;
-    processingModelTurnRef.current = false;
-    ignoringNextTurnRef.current = false;
-  }, []);
-
-  // Helper: Mute/Unmute Logic
-  const setMediaMute = useCallback((shouldMute: boolean) => {
-      if (streamRef.current) {
-          streamRef.current.getAudioTracks().forEach(track => {
-              track.enabled = !shouldMute;
-          });
-          setIsMuted(shouldMute);
-      }
-  }, []);
-
-  const stopAudioPlayback = useCallback(() => {
-    // 1. Synchronously stop all sources
-    activeSourcesRef.current.forEach(source => {
-        try { source.stop(); } catch (e) { /* ignore */ }
-    });
-    activeSourcesRef.current.clear();
+    const buffer = audioQueueRef.current.shift()!;
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    source.connect(ctx.destination);
     
-    // 2. Reset time cursor
-    if (outputAudioContextRef.current) {
-        nextStartTimeRef.current = outputAudioContextRef.current.currentTime;
+    const currentTime = ctx.currentTime;
+    // Add a tiny buffer to prevent overlap/glitches if we are slightly behind
+    if (nextStartTimeRef.current < currentTime) {
+        nextStartTimeRef.current = currentTime + 0.05;
     }
+    
+    source.start(nextStartTimeRef.current);
+    nextStartTimeRef.current += buffer.duration;
+    
+    currentSourceRef.current = source;
 
-    // 3. Reset logic flags
-    processingModelTurnRef.current = false;
-    setIsPlaying(false); // Trigger React update last
+    source.onended = () => {
+       if (currentSourceRef.current === source) {
+           playNextInQueue();
+       }
+    };
   }, []);
 
-  const sendTextMessage = useCallback((text: string) => {
-      if (sessionPromiseRef.current) {
-          sessionPromiseRef.current.then(session => {
-              session.sendRealtimeInput({ text });
-          });
+  const queueAudio = useCallback(async (base64Data: string) => {
+    // If we have been interrupted, discard all incoming audio for this turn
+    if (isInterruptedRef.current) return;
+
+    const ctx = audioContextsRef.current?.output;
+    if (!ctx) return;
+
+    try {
+      const buffer = await decodeAudioData(decode(base64Data), ctx, 24000, 1);
+      audioQueueRef.current.push(buffer);
+      
+      if (!isPlayingRef.current) {
+        playNextInQueue();
       }
+    } catch (e) {
+      console.error("Audio decode error", e);
+    }
+  }, [playNextInQueue]);
+
+  const interrupt = useCallback(() => {
+    console.log("Interrupting...");
+    isInterruptedRef.current = true;
+
+    // 1. Stop current source immediately
+    if (currentSourceRef.current) {
+        try { currentSourceRef.current.stop(); } catch(e) {}
+        currentSourceRef.current = null;
+    }
+    
+    // 2. Clear queue
+    audioQueueRef.current = [];
+    isPlayingRef.current = false;
+    nextStartTimeRef.current = 0;
+
+    // 3. Update State
+    setTurnState(TurnState.USER_SPEAKING);
+    
+    // 4. Send a text signal to the model to acknowledge the stop (optional, but helps reset context)
+    if (sessionRef.current) {
+        sessionRef.current.sendRealtimeInput({ text: "." }); 
+    }
   }, []);
 
-  // Sends a hidden system command.
-  // We set ignoringNextTurnRef = true so the model's verbal "Okay" response is discarded.
-  const sendControlMessage = useCallback((text: string) => {
-    if (sessionPromiseRef.current) {
-        ignoringNextTurnRef.current = true; // Flag to ignore the audio response
-        sessionPromiseRef.current.then(session => {
-            session.sendRealtimeInput({ text });
-        });
+  const changeSpeed = useCallback((mode: SpeedMode) => {
+    currentSpeedModeRef.current = mode;
+    pendingSpeedUpdateRef.current = true;
+    
+    // If we are currently listening to the user, we can send the update immediately
+    // so it applies to the current ongoing turn.
+    if (!isPlayingRef.current && sessionRef.current) {
+         const cmd = getSystemPromptForSpeed(mode);
+         sessionRef.current.sendRealtimeInput({ text: cmd });
+         pendingSpeedUpdateRef.current = false;
     }
+  }, []);
+
+  // --- Connection Logic ---
+
+  const disconnect = useCallback(() => {
+    if (streamRef.current) {
+        streamRef.current.getTracks().forEach(t => t.stop());
+    }
+    if (processorRef.current) {
+        processorRef.current.disconnect();
+        processorRef.current = null;
+    }
+    if (audioContextsRef.current) {
+        audioContextsRef.current.input.close();
+        audioContextsRef.current.output.close();
+        audioContextsRef.current = null;
+    }
+    if (sessionRef.current) {
+        sessionRef.current.close();
+        sessionRef.current = null;
+    }
+    
+    setConnectionState(ConnectionState.DISCONNECTED);
+    setTurnState(TurnState.USER_SPEAKING);
+    setErrorMessage(null);
+    setVolume(0);
   }, []);
 
   const connect = useCallback(async () => {
     try {
+      // Ensure clean state
+      disconnect(); 
       setConnectionState(ConnectionState.CONNECTING);
-      setErrorMessage(null);
       
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-
-      const inputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
-      const outputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
-      
-      inputAudioContextRef.current = inputCtx;
-      outputAudioContextRef.current = outputCtx;
-
-      const outputNode = outputCtx.createGain();
-      outputNode.connect(outputCtx.destination);
-      outputNodeRef.current = outputNode;
-
-      const analyser = outputCtx.createAnalyser();
-      analyser.fftSize = 256;
-      outputNode.connect(analyser);
-      analyserRef.current = analyser;
-
+      // 1. Setup Audio Contexts
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
       
-      // Initialize unmuted
-      setMediaMute(false);
+      const inputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+      const outputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+      audioContextsRef.current = { input: inputCtx, output: outputCtx };
 
+      // 2. Setup Processor
+      const source = inputCtx.createMediaStreamSource(stream);
+      const processor = inputCtx.createScriptProcessor(4096, 1, 1);
+      processorRef.current = processor;
+
+      source.connect(processor);
+      processor.connect(inputCtx.destination);
+
+      // 3. Setup GenAI
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
       const config = {
         model: 'gemini-2.5-flash-native-audio-preview-09-2025',
         config: {
@@ -151,20 +197,16 @@ export const useLiveAPI = ({ onTranscriptionUpdate }: UseLiveAPIProps) => {
             speechConfig: {
                 voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } },
             },
-            systemInstruction: `You are a professional bilingual language tutor. You are a native Russian speaker who is an expert in teaching English.
-
-            CORE BEHAVIOR:
-            1. LISTEN CAREFULLY.
-            2. IF USER SPEAKS RUSSIAN: You MUST respond in RUSSIAN. Explain concepts, translate, or answer questions in clear Russian. Then, prompt them to say the English equivalent.
-            3. IF USER SPEAKS ENGLISH: Respond in English to maintain the flow of practice. Correct mistakes gently.
-            4. Keep responses concise and natural.
-            5. NEVER pretend to be a monolingual English speaker.
+            systemInstruction: `You are a professional Russian-English language tutor. 
+            Your goal is to help a Russian speaker practice English.
             
-            IMPORTANT: If you receive a system instruction about speed (e.g., "[SYSTEM: ...]), ADAPT IMMEDIATELY for the next sentence. Do not discuss the speed setting.
-
-            Example:
-            User (RU): Как будет "собака"?
-            Model (RU): "Собака" по-английски будет "Dog". Попробуйте сказать: "I have a dog".`,
+            Protocol:
+            - If the user speaks Russian, reply in Russian, then guide them to say it in English.
+            - If the user speaks English, reply in English to keep the conversation going.
+            - Correct mistakes gently.
+            - Keep responses short and conversational.
+            - IMPORTANT: Always obey the "Speak slowly" or "Speak fast" commands immediately.
+            `,
             inputAudioTranscription: {},
             outputAudioTranscription: {},
         },
@@ -173,201 +215,89 @@ export const useLiveAPI = ({ onTranscriptionUpdate }: UseLiveAPIProps) => {
       const sessionPromise = ai.live.connect({
         model: config.model,
         callbacks: {
-          onopen: () => {
-            setConnectionState(ConnectionState.CONNECTED);
-            
-            if (!inputAudioContextRef.current || !streamRef.current) return;
-
-            const source = inputAudioContextRef.current.createMediaStreamSource(streamRef.current);
-            inputSourceRef.current = source;
-            
-            const processor = inputAudioContextRef.current.createScriptProcessor(4096, 1, 1);
-            processorRef.current = processor;
-
-            processor.onaudioprocess = (e) => {
-              const inputData = e.inputBuffer.getChannelData(0);
-              const pcmBlob = createBlob(inputData);
-              
-              let sum = 0;
-              for(let i=0; i<inputData.length; i++) sum += inputData[i] * inputData[i];
-              const rms = Math.sqrt(sum / inputData.length);
-              
-              if (streamRef.current?.getAudioTracks()[0]?.enabled) {
-                   setVolume(Math.min(rms * 5, 1)); 
-              }
-
-              sessionPromise.then((session) => {
-                session.sendRealtimeInput({ media: pcmBlob });
-              });
-            };
-
-            source.connect(processor);
-            processor.connect(inputAudioContextRef.current.destination);
-          },
-          onmessage: async (message: LiveServerMessage) => {
-            // Check turn completion
-            if (message.serverContent?.turnComplete) {
-                 processingModelTurnRef.current = false;
-                 
-                 // If we were ignoring this turn (control message), reset the flag
-                 if (ignoringNextTurnRef.current) {
-                     ignoringNextTurnRef.current = false;
-                 }
-
-                 // Standard logic: If no active audio is playing, unmute immediately
-                 // (Though typically turnComplete happens after the USER speaks, so we MUTE)
-                 // WAIT: turnComplete is sent by server when SERVER is done? No.
-                 // In Gemini Live API, turnComplete usually signals the end of the USER's turn being processed?
-                 // Actually, for Live API, turnComplete often means the model has finished its response generation.
-                 
-                 // However, for the "Walkie-Talkie" logic requested:
-                 // "Automatically apply mute to my mic if I finished speaking."
-                 // The Model detects the end of user speech (VAD).
-                 
-                 // If the message contains `interrupted`, it means the user spoke.
-            }
-            
-            // Handle Transcription (filtering out control messages)
-            if (!ignoringNextTurnRef.current) {
-                if (onTranscriptionUpdate) {
-                    if (message.serverContent?.outputTranscription?.text) {
-                        onTranscriptionUpdate('', message.serverContent.outputTranscription.text);
-                    } else if (message.serverContent?.inputTranscription?.text) {
-                        onTranscriptionUpdate(message.serverContent.inputTranscription.text, '');
-                    }
-                }
-            }
-
-            // Handle Audio
-            const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
-            if (base64Audio) {
-                if (ignoringNextTurnRef.current) {
-                    // Silently discard this audio chunk (it's likely "Okay" or "Understood")
-                    return;
+            onopen: () => {
+                setConnectionState(ConnectionState.CONNECTED);
+                setTurnState(TurnState.USER_SPEAKING);
+            },
+            onmessage: (message: LiveServerMessage) => {
+                // Audio
+                const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
+                if (base64Audio) {
+                    queueAudio(base64Audio);
                 }
 
-                if (outputAudioContextRef.current && outputNodeRef.current) {
-                    // 1. Audio incoming -> Mute mic to prevent echo/feedback
-                    // The model is starting to speak (or streaming chunks).
-                    if (!isMuted) {
-                        setMediaMute(true); 
-                    }
-                    
-                    processingModelTurnRef.current = true;
-                    setIsPlaying(true);
-
-                    const ctx = outputAudioContextRef.current;
-                    nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
-                    
-                    const audioBuffer = await decodeAudioData(
-                        decode(base64Audio),
-                        ctx,
-                        24000,
-                        1
-                    );
-
-                    const source = ctx.createBufferSource();
-                    source.buffer = audioBuffer;
-                    source.connect(outputNodeRef.current);
-                    
-                    source.addEventListener('ended', () => {
-                        activeSourcesRef.current.delete(source);
-                        // Check if queue is empty
-                        if (activeSourcesRef.current.size === 0) {
-                            setIsPlaying(false);
-                            // Do NOT automatically unmute here. 
-                            // The user requested: "Mic icon shows muted. I click it to speak."
-                            // But also: "Automatically mute if I finished speaking."
-                            // Logic:
-                            // 1. User speaks -> Silence -> Model speaks (Mic Muted)
-                            // 2. Model finishes -> Mic stays Muted? Or Mic opens?
-                            // User said: "Микрофон должен начинать меня слушать сразу после окончания ответа нейросети"
-                            // (Mic should start listening immediately after AI finishes answer)
-                            
-                            // So:
-                            if (!processingModelTurnRef.current) {
-                                setMediaMute(false); // Open mic automatically when AI finishes
-                            }
-                        }
-                    });
-
-                    source.start(nextStartTimeRef.current);
-                    activeSourcesRef.current.add(source);
-                    nextStartTimeRef.current += audioBuffer.duration;
+                // Transcription
+                if (message.serverContent?.outputTranscription?.text) {
+                    onTranscriptionUpdate('', message.serverContent.outputTranscription.text);
                 }
-            }
-
-            // Server-side turn completion or interruption
-            if (message.serverContent?.interrupted) {
-                stopAudioPlayback();
-                setMediaMute(false); // User interrupted, so ensure mic is open
-            }
-            
-            // Explicit turnComplete usually comes at end of generation
-            if (message.serverContent?.turnComplete) {
-                // If queue is empty, we can unmute
-                if (activeSourcesRef.current.size === 0) {
-                     setMediaMute(false);
+                if (message.serverContent?.inputTranscription?.text) {
+                     // When we get user transcription, it means the user is definitely speaking.
+                     // We can ensure interrupt flag is cleared.
+                     isInterruptedRef.current = false;
+                     onTranscriptionUpdate(message.serverContent.inputTranscription.text, '');
                 }
+
+                if (message.serverContent?.turnComplete) {
+                     // Server finished generating response.
+                     // We don't do anything special here, rely on audio queue to finish.
+                }
+            },
+            onclose: () => {
+                disconnect();
+            },
+            onerror: (e) => {
+                console.error(e);
+                setErrorMessage("Connection Error");
+                disconnect();
             }
-          },
-          onclose: () => {
-            setConnectionState(ConnectionState.DISCONNECTED);
-          },
-          onerror: (err) => {
-            console.error(err);
-            setErrorMessage("Ошибка соединения.");
-            setConnectionState(ConnectionState.ERROR);
-            cleanup();
-          }
         },
         config: config.config as any
       });
-      
-      sessionPromiseRef.current = sessionPromise;
 
-    } catch (error: any) {
-      setErrorMessage(error.message);
-      setConnectionState(ConnectionState.ERROR);
-      cleanup();
+      const session = await sessionPromise;
+      sessionRef.current = session;
+
+      // 4. Processing Loop
+      processor.onaudioprocess = (e) => {
+        const inputData = e.inputBuffer.getChannelData(0);
+        
+        // Calculate Volume
+        let sum = 0;
+        for(let i=0; i<inputData.length; i++) sum += inputData[i] * inputData[i];
+        const rms = Math.sqrt(sum / inputData.length);
+        setVolume(Math.min(rms * 5, 1));
+
+        // Sending Logic
+        // STRICTLY ignore input if AI is playing. This prevents echo.
+        if (!isPlayingRef.current) {
+            
+            // Check for pending speed updates
+            if (pendingSpeedUpdateRef.current && rms > 0.01) {
+                 const cmd = getSystemPromptForSpeed(currentSpeedModeRef.current);
+                 session.sendRealtimeInput({ text: cmd });
+                 pendingSpeedUpdateRef.current = false;
+            }
+
+            const pcmBlob = createBlob(inputData);
+            session.sendRealtimeInput({ media: pcmBlob });
+        }
+      };
+
+    } catch (e: any) {
+        console.error(e);
+        setErrorMessage(e.message || "Failed to connect");
+        disconnect();
     }
-  }, [cleanup, onTranscriptionUpdate, stopAudioPlayback, setMediaMute]);
-
-  const disconnect = useCallback(() => {
-    cleanup();
-  }, [cleanup]);
-
-  // The Big Button Logic
-  const toggleMute = useCallback(() => {
-    // 1. If AI is speaking (Playing), this is an INTERRUPT.
-    if (activeSourcesRef.current.size > 0 || isPlaying) {
-        stopAudioPlayback(); // Immediate silence
-        setMediaMute(false); // Immediate mic open
-        return;
-    }
-
-    // 2. If AI is silent, this is a standard Mic Toggle.
-    if (streamRef.current) {
-      const audioTracks = streamRef.current.getAudioTracks();
-      if (audioTracks.length > 0) {
-        const isCurrentlyEnabled = audioTracks[0].enabled;
-        // If enabled (true), we want to MUTE (false).
-        // If disabled (false/muted), we want to UNMUTE (true).
-        setMediaMute(isCurrentlyEnabled); 
-      }
-    }
-  }, [stopAudioPlayback, setMediaMute, isPlaying]);
+  }, [disconnect, onTranscriptionUpdate, queueAudio]);
 
   return {
     connect,
     disconnect,
-    toggleMute,
-    isMuted,
+    interrupt,
+    changeSpeed,
     connectionState,
+    turnState,
     errorMessage,
-    volume,
-    sendTextMessage,
-    sendControlMessage,
-    isPlaying
+    volume
   };
 };

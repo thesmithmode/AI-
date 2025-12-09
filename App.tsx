@@ -1,6 +1,7 @@
+
 import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { useLiveAPI } from './hooks/useLiveAPI';
-import { ConnectionState } from './types';
+import { ConnectionState, TurnState, SpeedMode } from './types';
 import Visualizer from './components/Visualizer';
 
 const CopyIcon = ({ className }: { className?: string }) => (
@@ -22,23 +23,16 @@ const MicIcon = ({ className }: { className?: string }) => (
   </svg>
 );
 
-const MicOffIcon = ({ className }: { className?: string }) => (
-  <svg xmlns="http://www.w3.org/2000/svg" className={className} fill="currentColor" viewBox="0 0 24 24">
-    <path d="M19 11h-1.7c0 .74-.16 1.43-.43 2.05l1.23 1.23c.56-.98.9-2.09.9-3.28zm-4.02.17c0-.06.02-.11.02-.17V5c0-1.66-1.34-3-3-3S9 3.34 9 5v.18l5.98 5.99zM4.27 3L3 4.27l6.01 6.01V11c0 1.66 1.33 3 2.99 3 .22 0 .44-.03.65-.08l2.97 2.97c-.85.35-1.76.57-2.71.58v1.85c1.28-.01 2.51-.32 3.6-1.01l3.4 3.4L21 20.23 4.27 3zM12 4c.55 0 1 .45 1 1v3.73l-2-2V5c0-.55.45-1 1-1zM7 9h2c0 1.13.31 2.18.84 3.09L7.38 14.5c-1.3-1.55-2.21-3.48-2.34-5.59L5 9h2z"/>
-  </svg>
-);
-
 const StopCircleIcon = ({ className }: { className?: string }) => (
   <svg xmlns="http://www.w3.org/2000/svg" className={className} viewBox="0 0 24 24" fill="currentColor">
     <path fillRule="evenodd" d="M2.25 12c0-5.385 4.365-9.75 9.75-9.75s9.75 4.365 9.75 9.75-4.365 9.75-9.75 9.75S2.25 17.385 2.25 12Zm6-2.25a.75.75 0 0 1 .75-.75h6a.75.75 0 0 1 .75.75v4.5a.75.75 0 0 1-.75.75h-6a.75.75 0 0 1-.75-.75v-4.5Z" clipRule="evenodd" />
   </svg>
 );
 
-
 const App: React.FC = () => {
   const [transcript, setTranscript] = useState<{user: string, model: string}[]>([]);
   const [copiedIndex, setCopiedIndex] = useState<{type: 'user'|'model'|'all', index?: number} | null>(null);
-  const [speedLevel, setSpeedLevel] = useState<number>(50); // 0 to 100
+  const [currentSpeed, setCurrentSpeed] = useState<SpeedMode>('normal');
   
   const transcriptEndRef = useRef<HTMLDivElement>(null);
 
@@ -61,31 +55,20 @@ const App: React.FC = () => {
     });
   }, []);
 
-  const { connect, disconnect, toggleMute, isMuted, isPlaying, connectionState, errorMessage, volume, sendControlMessage } = useLiveAPI({
-    onTranscriptionUpdate: handleTranscriptionUpdate
-  });
+  const { 
+    connect, 
+    disconnect, 
+    interrupt, 
+    changeSpeed,
+    connectionState, 
+    turnState, 
+    errorMessage, 
+    volume 
+  } = useLiveAPI({ onTranscriptionUpdate: handleTranscriptionUpdate });
 
-  const handleSpeedChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-      setSpeedLevel(parseInt(e.target.value));
-  };
-
-  const handleSpeedCommit = () => {
-      let prompt = "";
-      // Strong, distinct prompts for each level
-      if (speedLevel <= 10) {
-          prompt = "[SYSTEM: SPEAK_EXTREMELY_SLOWLY]. Enunciate every syllable like teaching a beginner.";
-      } else if (speedLevel <= 30) {
-          prompt = "[SYSTEM: SPEAK_SLOWLY]. Speak clearly and slowly.";
-      } else if (speedLevel <= 60) {
-          prompt = "[SYSTEM: SPEAK_NORMALLY]. Use a natural conversational pace.";
-      } else if (speedLevel <= 85) {
-          prompt = "[SYSTEM: SPEAK_FAST]. Speak quickly, like a fluent native speaker.";
-      } else {
-          prompt = "[SYSTEM: SPEAK_EXTREMELY_FAST]. Speak very fast, rapid-fire English.";
-      }
-      
-      // Use sendControlMessage to suppress the verbal "Okay" and the transcript log
-      sendControlMessage(prompt);
+  const handleModeChange = (mode: SpeedMode) => {
+      setCurrentSpeed(mode);
+      changeSpeed(mode); 
   };
 
   const copyToClipboard = (text: string, type: 'user' | 'model' | 'all', index?: number) => {
@@ -107,6 +90,16 @@ const App: React.FC = () => {
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [transcript]);
+
+  const speedOptions: { id: SpeedMode, label: string }[] = [
+      { id: 'v-slow', label: 'Очень медленно' },
+      { id: 'slow', label: 'Медленно' },
+      { id: 'normal', label: 'Нормально' },
+      { id: 'fast', label: 'Быстро' },
+      { id: 'v-fast', label: 'Очень быстро' },
+  ];
+
+  const isAISpeaking = turnState === TurnState.AI_SPEAKING;
 
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col items-center p-4 md:p-8">
@@ -158,10 +151,10 @@ const App: React.FC = () => {
 
         {/* Visualizer Area */}
         <div className="flex-none p-6 flex flex-col items-center justify-center bg-slate-900 min-h-[140px] relative transition-colors duration-500 border-b border-slate-800">
-           <Visualizer isActive={connectionState === ConnectionState.CONNECTED && !isMuted} volume={volume} />
+           <Visualizer isActive={connectionState === ConnectionState.CONNECTED && !isAISpeaking} volume={volume} />
            <p className="mt-4 text-slate-400 text-sm font-medium animate-fade-in h-5">
              {connectionState === ConnectionState.CONNECTED 
-               ? (isPlaying ? 'AI говорит...' : (isMuted ? 'Микрофон выключен (нажмите чтобы говорить)' : 'Слушаю вас...'))
+               ? (isAISpeaking ? 'AI говорит (нажмите кнопку, чтобы прервать)' : 'Слушаю вас... Говорите')
                : 'Начните урок'}
            </p>
         </div>
@@ -171,7 +164,7 @@ const App: React.FC = () => {
             {transcript.length === 0 && connectionState === ConnectionState.CONNECTED && (
                 <div className="text-center text-slate-400 mt-8 p-4 bg-white rounded-xl border border-slate-100 shadow-sm">
                     <p>👋 Урок начался!</p>
-                    <p className="text-sm mt-1">AI начнет говорить первым. Или скажите "Привет".</p>
+                    <p className="text-sm mt-1">Скажите что-нибудь по-русски или по-английски.</p>
                 </div>
             )}
             
@@ -218,22 +211,33 @@ const App: React.FC = () => {
                 </div>
             )}
             
-            {/* Speed Control */}
+            {/* Speed Control Modes */}
             {connectionState === ConnectionState.CONNECTED && (
-                <div className="w-full flex items-center gap-3 mb-6 px-4">
-                    <span className="text-xs text-slate-400 font-bold uppercase tracking-wider w-16">Медленно</span>
-                    <input 
-                        type="range" 
-                        min="0" 
-                        max="100" 
-                        step="10"
-                        value={speedLevel}
-                        onChange={handleSpeedChange}
-                        onMouseUp={handleSpeedCommit}
-                        onTouchEnd={handleSpeedCommit}
-                        className="flex-1 h-1.5 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-indigo-600"
-                    />
-                    <span className="text-xs text-slate-400 font-bold uppercase tracking-wider w-16 text-right">Быстро</span>
+                <div className="mb-6">
+                    <div className="flex justify-between items-center mb-2">
+                         <span className="text-xs text-slate-400 font-bold uppercase tracking-wider">Скорость речи (применится к след. фразе)</span>
+                    </div>
+                    <div className="flex w-full bg-slate-100 p-1 rounded-xl">
+                        {speedOptions.map((option) => (
+                            <button
+                                key={option.id}
+                                onClick={() => handleModeChange(option.id)}
+                                className={`flex-1 py-2 text-xs font-medium rounded-lg transition-all ${
+                                    currentSpeed === option.id 
+                                    ? 'bg-white text-indigo-600 shadow-sm ring-1 ring-slate-200' 
+                                    : 'text-slate-500 hover:text-slate-700 hover:bg-slate-200/50'
+                                }`}
+                            >
+                                <span className="hidden sm:inline">{option.label}</span>
+                                <span className="sm:hidden">{
+                                    option.id === 'v-slow' ? '0.5x' :
+                                    option.id === 'slow' ? '0.7x' :
+                                    option.id === 'normal' ? '1x' :
+                                    option.id === 'fast' ? '1.2x' : '1.5x'
+                                }</span>
+                            </button>
+                        ))}
+                    </div>
                 </div>
             )}
 
@@ -241,22 +245,20 @@ const App: React.FC = () => {
             <div className="flex items-center justify-center">
                 {connectionState === ConnectionState.CONNECTED ? (
                     <button
-                        onClick={toggleMute}
+                        onClick={isAISpeaking ? interrupt : undefined}
                         className={`
-                          w-20 h-20 rounded-full shadow-lg flex items-center justify-center transition-all transform active:scale-95
-                          ${isPlaying 
-                            ? 'bg-rose-500 text-white hover:bg-rose-600 ring-4 ring-rose-200 animate-pulse' 
-                            : (isMuted 
-                                ? 'bg-slate-100 text-slate-400 hover:bg-slate-200 ring-4 ring-slate-100' 
-                                : 'bg-indigo-600 text-white hover:bg-indigo-700 ring-4 ring-indigo-200')
+                          w-20 h-20 rounded-full shadow-lg flex items-center justify-center transition-all 
+                          ${isAISpeaking 
+                            ? 'bg-rose-500 text-white hover:bg-rose-600 ring-4 ring-rose-200 animate-pulse cursor-pointer' 
+                            : 'bg-indigo-100 text-indigo-600 ring-4 ring-indigo-50 cursor-default'
                           }
                         `}
-                        title={isPlaying ? "Прервать (Говорить)" : (isMuted ? "Включить микрофон" : "Выключить микрофон")}
+                        title={isAISpeaking ? "Прервать AI и говорить" : "Микрофон активен, говорите"}
                     >
-                        {isPlaying ? (
+                        {isAISpeaking ? (
                             <StopCircleIcon className="h-10 w-10" />
                         ) : (
-                            isMuted ? <MicOffIcon className="h-8 w-8 text-slate-500" /> : <MicIcon className="h-8 w-8" />
+                            <MicIcon className="h-8 w-8" />
                         )}
                     </button>
                 ) : (
@@ -281,7 +283,7 @@ const App: React.FC = () => {
             </div>
             {connectionState === ConnectionState.CONNECTED && (
                  <div className="text-center mt-3 text-xs text-slate-400">
-                     {isPlaying ? 'Нажмите, чтобы прервать AI и говорить' : (isMuted ? 'Микрофон отключен. Нажмите, чтобы говорить' : 'Микрофон включен. Говорите, AI ответит когда вы закончите')}
+                     {isAISpeaking ? 'Нажмите, чтобы прервать AI' : 'Микрофон включен автоматически. Говорите.'}
                  </div>
             )}
         </div>
