@@ -34,12 +34,6 @@ const StopCircleIcon = ({ className }: { className?: string }) => (
   </svg>
 );
 
-const PowerIcon = ({ className }: { className?: string }) => (
-    <svg xmlns="http://www.w3.org/2000/svg" className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor">
-        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
-    </svg>
-)
-
 
 const App: React.FC = () => {
   const [transcript, setTranscript] = useState<{user: string, model: string}[]>([]);
@@ -76,13 +70,22 @@ const App: React.FC = () => {
   };
 
   const handleSpeedCommit = () => {
-      let prompt = "Speak at a normal pace.";
-      if (speedLevel < 25) prompt = "Please speak very slowly and clearly, as if teaching a beginner.";
-      else if (speedLevel < 45) prompt = "Please speak a bit slower than normal.";
-      else if (speedLevel > 60) prompt = "Please speak faster.";
-      else if (speedLevel > 85) prompt = "Please speak very fast.";
+      let prompt = "";
+      // Stronger prompts for speed control
+      if (speedLevel <= 20) {
+          prompt = "INSTRUCTION: Speak EXTREMELY SLOWLY and articulate every syllable clearly.";
+      } else if (speedLevel <= 40) {
+          prompt = "INSTRUCTION: Speak slowly and clearly.";
+      } else if (speedLevel <= 60) {
+          prompt = "INSTRUCTION: Speak at a normal, natural conversational pace.";
+      } else if (speedLevel <= 80) {
+          prompt = "INSTRUCTION: Speak quickly.";
+      } else {
+          prompt = "INSTRUCTION: Speak very fast, like a native speaker in a rush.";
+      }
       
-      sendTextMessage(`System: ${prompt}`);
+      console.log("Sending speed instruction:", prompt);
+      sendTextMessage(prompt);
   };
 
   const copyToClipboard = (text: string, type: 'user' | 'model' | 'all', index?: number) => {
@@ -158,7 +161,7 @@ const App: React.FC = () => {
            <Visualizer isActive={connectionState === ConnectionState.CONNECTED && !isMuted} volume={volume} />
            <p className="mt-4 text-slate-400 text-sm font-medium animate-fade-in">
              {connectionState === ConnectionState.CONNECTED 
-               ? (isPlaying ? 'Слушайте...' : (isMuted ? 'Микрофон выключен (нажмите чтобы говорить)' : 'Говорите...'))
+               ? (isPlaying ? 'AI говорит...' : (isMuted ? 'Микрофон выключен (нажмите чтобы включить)' : 'Слушаю вас...'))
                : 'Начните урок'}
            </p>
         </div>
@@ -252,7 +255,7 @@ const App: React.FC = () => {
                         {isPlaying ? (
                             <StopCircleIcon className="h-10 w-10" />
                         ) : (
-                            isMuted ? <MicOffIcon className="h-8 w-8" /> : <MicIcon className="h-8 w-8" />
+                            isMuted ? <MicOffIcon className="h-8 w-8 text-slate-500" /> : <MicIcon className="h-8 w-8" />
                         )}
                     </button>
                 ) : (
@@ -277,7 +280,7 @@ const App: React.FC = () => {
             </div>
             {connectionState === ConnectionState.CONNECTED && (
                  <div className="text-center mt-3 text-xs text-slate-400">
-                     {isPlaying ? 'Нажмите, чтобы прервать и говорить' : (isMuted ? 'Микрофон отключен' : 'Микрофон включен')}
+                     {isPlaying ? 'Нажмите, чтобы прервать AI' : (isMuted ? 'Микрофон отключен (вас не слышно)' : 'Микрофон включен (вас слышно)')}
                  </div>
             )}
         </div>

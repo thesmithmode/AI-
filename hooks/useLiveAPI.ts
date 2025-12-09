@@ -12,6 +12,7 @@ export const useLiveAPI = ({ onTranscriptionUpdate }: UseLiveAPIProps) => {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [volume, setVolume] = useState<number>(0);
   const [isMuted, setIsMuted] = useState<boolean>(false);
+  const [isPlaying, setIsPlaying] = useState<boolean>(false);
 
   // Audio Contexts and Nodes
   const inputAudioContextRef = useRef<AudioContext | null>(null);
@@ -35,6 +36,7 @@ export const useLiveAPI = ({ onTranscriptionUpdate }: UseLiveAPIProps) => {
       try { source.stop(); } catch (e) { /* ignore */ }
     });
     activeSourcesRef.current.clear();
+    setIsPlaying(false);
 
     if (inputAudioContextRef.current) {
       inputAudioContextRef.current.close();
@@ -82,6 +84,7 @@ export const useLiveAPI = ({ onTranscriptionUpdate }: UseLiveAPIProps) => {
         activeSourcesRef.current.clear();
         nextStartTimeRef.current = outputAudioContextRef.current.currentTime;
         processingModelTurnRef.current = false;
+        setIsPlaying(false);
     }
   }, []);
 
@@ -136,6 +139,8 @@ export const useLiveAPI = ({ onTranscriptionUpdate }: UseLiveAPIProps) => {
             3. IF USER SPEAKS ENGLISH: Respond in English to maintain the flow of practice. Correct mistakes gently.
             4. Keep responses concise and natural.
             5. NEVER pretend to be a monolingual English speaker.
+            
+            IMPORTANT: If the user asks you to speak faster or slower, ADJUST your speaking rate immediately for all future responses.
 
             Example:
             User (RU): Как будет "собака"?
@@ -202,6 +207,7 @@ export const useLiveAPI = ({ onTranscriptionUpdate }: UseLiveAPIProps) => {
                 // and to follow "Mic starts listening AFTER answer" rule
                 setMediaMute(true);
                 processingModelTurnRef.current = true;
+                setIsPlaying(true);
 
                 const ctx = outputAudioContextRef.current;
                 nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
@@ -219,9 +225,13 @@ export const useLiveAPI = ({ onTranscriptionUpdate }: UseLiveAPIProps) => {
                 
                 source.addEventListener('ended', () => {
                     activeSourcesRef.current.delete(source);
-                    // If this was the last source AND the model is done generating, unmute
-                    if (activeSourcesRef.current.size === 0 && !processingModelTurnRef.current) {
-                        setMediaMute(false);
+                    // Check if queue is empty
+                    if (activeSourcesRef.current.size === 0) {
+                        setIsPlaying(false);
+                        // If this was the last source AND the model is done generating, unmute
+                        if (!processingModelTurnRef.current) {
+                            setMediaMute(false);
+                        }
                     }
                 });
 
@@ -263,15 +273,16 @@ export const useLiveAPI = ({ onTranscriptionUpdate }: UseLiveAPIProps) => {
   }, [cleanup]);
 
   const toggleMute = useCallback(() => {
-    // If currently playing audio, this button acts as INTERRUPT
+    // INTERRUPT LOGIC:
+    // If audio is playing (queue not empty), we stop it and UNMUTE.
     if (activeSourcesRef.current.size > 0) {
         stopAudioPlayback();
         setMediaMute(false); // Enable mic to talk
-        // Send a text signal to clear model context? Usually sending audio is enough.
         return;
     }
 
-    // Normal Mute Toggle
+    // MANUAL MUTE LOGIC:
+    // If no audio is playing, allow user to toggle mute manually.
     if (streamRef.current) {
       const audioTracks = streamRef.current.getAudioTracks();
       if (audioTracks.length > 0) {
@@ -307,6 +318,6 @@ export const useLiveAPI = ({ onTranscriptionUpdate }: UseLiveAPIProps) => {
     errorMessage,
     volume,
     sendTextMessage,
-    isPlaying: activeSourcesRef.current.size > 0
+    isPlaying // Now a reactive state
   };
 };
